@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+#
+# tmux-thaw — Restore tmux sessions from a tmux-freeze snapshot.
+#
+# Usage:
+#   tmux-thaw                           # restore from latest snapshot
+#   tmux-thaw SNAPSHOT_FILE             # restore from a specific file
+#   tmux-thaw --dry-run [FILE]          # preview what would be restored
+#   tmux-thaw --no-commands [FILE]      # restore layout only, skip commands
+#   tmux-thaw --interactive [FILE]      # prompt before each command
+#
+# Requires: jq
+
+set -euo pipefail
+
+FREEZE_DIR="${TMUX_FREEZE_DIR:-$HOME/.tmux-freeze}"
+
+# ── flags ────────────────────────────────────────────────────────────────────
+
+DRY_RUN=false
+NO_COMMANDS=false
+INTERACTIVE=false
+SNAPSHOT_FILE=""
+
+usage() {
+  cat <<'EOF'
+tmux-thaw — Restore tmux sessions from a tmux-freeze snapshot.
+
+Usage:
+  tmux-thaw                           Restore from latest snapshot
+  tmux-thaw SNAPSHOT_FILE             Restore from a specific file
+  tmux-thaw --dry-run [FILE]          Preview what would be restored
+  tmux-thaw --no-commands [FILE]      Restore layout only, skip commands
+  tmux-thaw --interactive [FILE]      Prompt before launching each command
+  tmux-thaw --help                    Show this help
+
+Requires: jq
+EOF
+  exit 0
+}
+
+die() { echo "tmux-thaw: error: $*" >&2; exit 1; }
+
+load_skip_patterns() {
+  # Hardcoded defaults
+  SKIP_PATTERNS=(
+    "^claude$" "^claude " "^aider$" "^aider " "^cursor$"
+  )
+
+  # Look for user config file
+  local config_file="${TMUX_THAW_SKIP_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/tmux-freeze/skip-patterns}"
+
+  if [ -f "$config_file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      # Skip blank lines
+      [[ -z "${line// }" ]] && continue
+      # Skip full-line comments (first non-whitespace is #)
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      SKIP_PATTERNS+=("$line")
+    done < "$config_file"
+  fi
+}
+
+# ── parse args ───────────────────────────────────────────────────────────────
+
+# Allow sourcing for testing without executing main logic
+[[ "${BASH_SOURCE[0]}" != "${0}" ]] && return 0 2>/dev/null
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --help|-h)        usage ;;
+    --dry-run|-n)     DRY_RUN=true; shift ;;
+    --no-commands|-C) NO_COMMANDS=true; shift ;;
+    --interactive|-i) INTERACTIVE=true; shift ;;
+    -*)               die "unknown flag: $1" ;;
+    *)                SNAPSHOT_FILE="$1"; shift ;;
+  esac
+done
+
+load_skip_patterns
+
+# ── resolve snapshot ─────────────────────────────────────────────────────────
+
+if [ -z "$SNAPSHOT_FILE" ]; then
+  SNAPSHOT_FILE="$FREEZE_DIR/latest.json"
+fi
+
+[ -f "$SNAPSHOT_FILE" ] || die "snapshot not found: $SNAPSHOT_FILE"
+
+# Check for jq
+command -v jq &>/dev/null || die "jq is required. Install with: sudo apt install jq / brew install jq"
+
+# Validate JSON
+jq empty "$SNAPSHOT_FILE" 2>/dev/null || die "invalid JSON: $SNAPSHOT_FILE"
+
+echo "tmux-thaw: restoring from $(basename "$SNAPSHOT_FILE")"
+echo "  frozen at: $(jq -r '.frozen_at' "$SNAPSHOT_FILE")"
+echo "  hostname:  $(jq -r '.hostname' "$SNAPSHOT_FILE")"
+echo ""
+
+# ── dangerous command detection ──────────────────────────────────────────────
+
+is_safe_command() {
+  local cmd="$1"
+
+  # Empty is fine (just open a shell)
+  [ -z "$cmd" ] && return 0
+
+  # Allowlist of commonly safe-to-restart commands
+  local safe_patterns=(
+    "^vim " "^nvim " "^nano " "^emacs " "^less " "^man " "^htop$" "^btop$" "^top$"
+    "^tail " "^watch " "^python " "^python3 " "^node " "^ruby " "^cargo "
+    "^npm " "^yarn " "^pnpm " "^make" "^go run " "^go build"
+    "^docker " "^kubectl " "^ssh " "^jupyter" "^ipython"
+    "^git " "^tig$" "^lazygit$" "^lazydocker$"
+    "^rails " "^flask " "^uvicorn " "^gunicorn " "^next " "^vite"
+  )
+
+  for pattern in "${safe_patterns[@]}"; do
+    if echo "$cmd" | grep -qE "$pattern"; then
+      return 0
+    fi
+  done
+
+  # Skip commands that can't be meaningfully restarted (stateful interactive sessions)
+  for pattern in "${SKIP_PATTERNS[@]}"; do
+    if echo "$cmd" | grep -qE "$pattern"; then
+      return 1
+    fi
+  done
+
+  # Flag potentially destructive commands
+  local dangerous_patterns=(
+    "^rm " "^sudo rm" "^dd " "^mkfs" "^format" "^fdisk"
+    "> /dev/" "^:(){ " "^fork"
+  )
+
+  for pattern in "${dangerous_patterns[@]}"; do
+    if echo "$cmd" | grep -qE "$pattern"; then
+      return 1
+    fi
+  done
+
+  # Unknown → depends on mode
+  return 2
+}
+
+prompt_command() {
+  local cmd="$1"
+  local pane_path="$2"
+
+  echo ""
+  echo "  Command:   $cmd"
+  echo "  Directory: $pane_path"
+  read -rp "  Run this command? [Y/n/e(dit)/s(kip all)] " answer
+  case "${answer,,}" in
+    n|no)   return 1 ;;
+    s|skip) NO_COMMANDS=true; return 1 ;;
+    e|edit)
+      read -rp "  Enter new command: " new_cmd
+      # Set global variable for caller to pick up
+      EDITED_CMD="$new_cmd"
+      return 0
+      ;;
+    *)      EDITED_CMD=""; return 0 ;;
+  esac
+}
+
+# ── restore logic ────────────────────────────────────────────────────────────
+
+EDITED_CMD=""
+
+num_sessions=$(jq '.sessions | length' "$SNAPSHOT_FILE")
+
+for ((s=0; s < num_sessions; s++)); do
+  session_name=$(jq -r ".sessions[$s].session_name" "$SNAPSHOT_FILE")
+  base_index=$(jq -r ".sessions[$s].base_index // 0" "$SNAPSHOT_FILE")
+  active_window=$(jq -r ".sessions[$s].active_window // $base_index" "$SNAPSHOT_FILE")
+  num_windows=$(jq ".sessions[$s].windows | length" "$SNAPSHOT_FILE")
+
+  echo "Session: $session_name ($num_windows window(s))"
+
+  # Check if session already exists
+  if tmux has-session -t "$session_name" 2>/dev/null; then
+    echo "  ⚠ Session '$session_name' already exists — skipping"
+    echo "    (kill it first with: tmux kill-session -t $session_name)"
+    continue
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    for ((w=0; w < num_windows; w++)); do
+      win_name=$(jq -r ".sessions[$s].windows[$w].name" "$SNAPSHOT_FILE")
+      win_idx=$(jq -r ".sessions[$s].windows[$w].index" "$SNAPSHOT_FILE")
+      num_panes=$(jq ".sessions[$s].windows[$w].panes | length" "$SNAPSHOT_FILE")
+      echo "  Window $win_idx: '$win_name' ($num_panes pane(s))"
+
+      for ((p=0; p < num_panes; p++)); do
+        pane_path=$(jq -r ".sessions[$s].windows[$w].panes[$p].path" "$SNAPSHOT_FILE")
+        pane_cmd=$(jq -r ".sessions[$s].windows[$w].panes[$p].command // empty" "$SNAPSHOT_FILE")
+        echo "    Pane $p: $pane_path"
+        [ -n "$pane_cmd" ] && echo "      → $pane_cmd"
+      done
+    done
+    echo ""
+    continue
+  fi
+
+  # ── create the session with the first window's first pane ──────────────
+
+  first_win_idx=$(jq -r ".sessions[$s].windows[0].index" "$SNAPSHOT_FILE")
+  first_win_name=$(jq -r ".sessions[$s].windows[0].name" "$SNAPSHOT_FILE")
+  first_pane_path=$(jq -r ".sessions[$s].windows[0].panes[0].path // \"$HOME\"" "$SNAPSHOT_FILE")
+
+  # Fall back to $HOME if directory no longer exists
+  [ -d "$first_pane_path" ] || first_pane_path="$HOME"
+
+  tmux new-session -d -s "$session_name" -n "$first_win_name" -c "$first_pane_path" -x 200 -y 50
+
+  # ── iterate windows ──────────────────────────────────────────────────────
+
+  for ((w=0; w < num_windows; w++)); do
+    win_idx=$(jq -r ".sessions[$s].windows[$w].index" "$SNAPSHOT_FILE")
+    win_name=$(jq -r ".sessions[$s].windows[$w].name" "$SNAPSHOT_FILE")
+    win_layout=$(jq -r ".sessions[$s].windows[$w].layout" "$SNAPSHOT_FILE")
+    active_pane=$(jq -r ".sessions[$s].windows[$w].active_pane // 0" "$SNAPSHOT_FILE")
+    num_panes=$(jq ".sessions[$s].windows[$w].panes | length" "$SNAPSHOT_FILE")
+
+    echo "  Window $win_idx: '$win_name'"
+
+    # Create window (first one already exists from new-session)
+    if [ "$w" -gt 0 ]; then
+      local_pane_path=$(jq -r ".sessions[$s].windows[$w].panes[0].path // \"$HOME\"" "$SNAPSHOT_FILE")
+      [ -d "$local_pane_path" ] || local_pane_path="$HOME"
+      tmux new-window -t "${session_name}:${win_idx}" -n "$win_name" -c "$local_pane_path"
+    fi
+
+    # Create additional panes (first pane already exists)
+    for ((p=1; p < num_panes; p++)); do
+      pane_path=$(jq -r ".sessions[$s].windows[$w].panes[$p].path // \"$HOME\"" "$SNAPSHOT_FILE")
+      [ -d "$pane_path" ] || pane_path="$HOME"
+      tmux split-window -t "${session_name}:${win_idx}" -c "$pane_path"
+    done
+
+    # Apply the saved layout (this repositions/resizes all panes)
+    if [ -n "$win_layout" ] && [ "$win_layout" != "null" ]; then
+      tmux select-layout -t "${session_name}:${win_idx}" "$win_layout" 2>/dev/null || true
+    fi
+
+    # ── send commands to each pane ─────────────────────────────────────────
+
+    for ((p=0; p < num_panes; p++)); do
+      pane_path=$(jq -r ".sessions[$s].windows[$w].panes[$p].path // \"$HOME\"" "$SNAPSHOT_FILE")
+      pane_cmd=$(jq -r ".sessions[$s].windows[$w].panes[$p].command // empty" "$SNAPSHOT_FILE")
+      pane_venv=$(jq -r ".sessions[$s].windows[$w].panes[$p].virtualenv // empty" "$SNAPSHOT_FILE")
+      target="${session_name}:${win_idx}.${p}"
+
+      # cd to the right directory (pane 0 of each window was already cd'd)
+      if [ "$p" -gt 0 ] || [ "$w" -eq 0 ] && [ "$p" -eq 0 ]; then
+        # The split-window -c handles cd, but ensure it for pane 0 of window 0
+        if [ -d "$pane_path" ]; then
+          tmux send-keys -t "$target" "cd $(printf '%q' "$pane_path")" Enter
+        fi
+      fi
+
+      # Activate virtualenv if present
+      if [ -n "$pane_venv" ] && [ -d "$pane_venv" ]; then
+        tmux send-keys -t "$target" "source $(printf '%q' "$pane_venv")/bin/activate" Enter
+      fi
+
+      # Send the command
+      if [ -n "$pane_cmd" ] && [ "$NO_COMMANDS" = false ]; then
+        EDITED_CMD=""
+        should_run=true
+
+        if [ "$INTERACTIVE" = true ]; then
+          if ! prompt_command "$pane_cmd" "$pane_path"; then
+            should_run=false
+          elif [ -n "$EDITED_CMD" ]; then
+            pane_cmd="$EDITED_CMD"
+          fi
+        else
+          safety=0
+          is_safe_command "$pane_cmd" || safety=$?
+          if [ "$safety" -eq 1 ]; then
+            echo "    ⚠ Skipping dangerous command: $pane_cmd"
+            should_run=false
+          fi
+        fi
+
+        if [ "$should_run" = true ]; then
+          echo "    Pane $p: → $pane_cmd"
+          tmux send-keys -t "$target" "$pane_cmd" Enter
+        else
+          echo "    Pane $p: (command skipped)"
+        fi
+      fi
+    done
+
+    # Select the active pane
+    tmux select-pane -t "${session_name}:${win_idx}.${active_pane}" 2>/dev/null || true
+  done
+
+  # Select the active window
+  tmux select-window -t "${session_name}:${active_window}" 2>/dev/null || true
+
+  echo "  ✓ Session '$session_name' restored"
+done
+
+if [ "$DRY_RUN" = true ]; then
+  echo "(dry run — nothing was created)"
+else
+  echo ""
+  echo "Done. Attach with:  tmux attach -t SESSION_NAME"
+fi

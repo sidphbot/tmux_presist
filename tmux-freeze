@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+#
+# tmux-freeze — Snapshot a tmux session's layout, panes, working directories,
+#               and running commands into a JSON manifest that tmux-thaw can
+#               restore after a reboot.
+#
+# Usage:
+#   tmux-freeze [SESSION_NAME]          # freeze a specific session
+#   tmux-freeze                         # freeze ALL sessions
+#   tmux-freeze --list                  # list saved snapshots
+#   tmux-freeze --delete SNAPSHOT       # delete a saved snapshot
+#
+# Snapshots are saved to: ~/.tmux-freeze/<session>_<timestamp>.json
+
+set -euo pipefail
+
+FREEZE_DIR="${TMUX_FREEZE_DIR:-$HOME/.tmux-freeze}"
+mkdir -p "$FREEZE_DIR"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+tmux-freeze — Snapshot tmux sessions for restoration after reboot.
+
+Usage:
+  tmux-freeze [SESSION_NAME]    Freeze one session (or all if omitted)
+  tmux-freeze --list            List saved snapshots
+  tmux-freeze --delete NAME     Delete a snapshot file
+  tmux-freeze --help            Show this help
+
+Snapshots are saved to ~/.tmux-freeze/ (override with TMUX_FREEZE_DIR).
+EOF
+  exit 0
+}
+
+die() { echo "tmux-freeze: error: $*" >&2; exit 1; }
+
+json_escape() {
+  # Minimal JSON string escaper (handles \, ", newlines, tabs)
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | tr '\n' ' '
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+list_snapshots() {
+  echo "Saved snapshots in $FREEZE_DIR:"
+  if [ -z "$(ls -A "$FREEZE_DIR" 2>/dev/null)" ]; then
+    echo "  (none)"
+  else
+    for f in "$FREEZE_DIR"/*.json; do
+      [ -f "$f" ] || continue
+      local base
+      base=$(basename "$f" .json)
+      local size
+      size=$(wc -c < "$f" | tr -d ' ')
+      local sessions
+      sessions=$(grep -o '"session_name"' "$f" 2>/dev/null | wc -l | tr -d ' ')
+      echo "  $base  (${size}B, ${sessions} session(s))"
+    done
+  fi
+  exit 0
+}
+
+delete_snapshot() {
+  local name="$1"
+  local target="$FREEZE_DIR/${name}.json"
+  [ -f "$target" ] || target="$FREEZE_DIR/${name}"
+  [ -f "$target" ] || die "snapshot not found: $name"
+  rm -f "$target"
+  echo "Deleted: $target"
+  exit 0
+}
+
+# ── pane capture ─────────────────────────────────────────────────────────────
+
+get_pane_command() {
+  local pane_pid="$1"
+
+  # Get child processes of the shell running in this pane
+  # We want the foreground command, not the shell itself.
+  local children
+  children=$(ps --ppid "$pane_pid" -o pid=,comm=,args= 2>/dev/null | head -5) || true
+
+  if [ -z "$children" ]; then
+    echo ""
+    return
+  fi
+
+  # Filter out the shell itself and common non-interesting processes
+  local cmd=""
+  while IFS= read -r line; do
+    local proc_comm
+    proc_comm=$(echo "$line" | awk '{print $2}')
+    local proc_args
+    proc_args=$(echo "$line" | awk '{$1=""; $2=""; print}' | sed 's/^ *//')
+
+    # Skip shells and tmux internals
+    case "$proc_comm" in
+      bash|zsh|sh|fish|dash|tcsh|csh|tmux*) continue ;;
+    esac
+
+    cmd="$proc_args"
+    break
+  done <<< "$children"
+
+  echo "$cmd"
+}
+
+# ── freeze session ───────────────────────────────────────────────────────────
+
+freeze_session() {
+  local session="$1"
+  local first_window=true
+
+  echo "  {"
+  echo "    \"session_name\": \"$(json_escape "$session")\","
+
+  # Session-level options
+  local base_index
+  base_index=$(tmux show-options -t "$session" -gv base-index 2>/dev/null || echo "0")
+  echo "    \"base_index\": $base_index,"
+
+  # Active window
+  local active_window
+  active_window=$(tmux display-message -t "$session" -p '#{window_index}' 2>/dev/null || echo "$base_index")
+  echo "    \"active_window\": $active_window,"
+
+  echo "    \"windows\": ["
+
+  # Iterate windows
+  tmux list-windows -t "$session" -F '#{window_index}|#{window_name}|#{window_layout}|#{window_active}' | \
+  while IFS='|' read -r win_idx win_name win_layout win_active; do
+    if [ "$first_window" = true ]; then
+      first_window=false
+    else
+      echo "      ,"
+    fi
+
+    echo "      {"
+    echo "        \"index\": $win_idx,"
+    echo "        \"name\": \"$(json_escape "$win_name")\","
+    echo "        \"layout\": \"$(json_escape "$win_layout")\","
+    echo "        \"active\": $( [ "$win_active" = "1" ] && echo "true" || echo "false" ),"
+
+    # Active pane in this window
+    local active_pane
+    active_pane=$(tmux display-message -t "${session}:${win_idx}" -p '#{pane_index}' 2>/dev/null || echo "0")
+    echo "        \"active_pane\": $active_pane,"
+
+    echo "        \"panes\": ["
+
+    local first_pane=true
+    tmux list-panes -t "${session}:${win_idx}" -F '#{pane_index}|#{pane_current_path}|#{pane_pid}|#{pane_width}|#{pane_height}|#{pane_title}' | \
+    while IFS='|' read -r pane_idx pane_path pane_pid pane_w pane_h pane_title; do
+      if [ "$first_pane" = true ]; then
+        first_pane=false
+      else
+        echo "          ,"
+      fi
+
+      # Determine what command (if any) is running in this pane
+      local pane_cmd
+      pane_cmd=$(get_pane_command "$pane_pid")
+
+      # Get the shell
+      local pane_shell
+      pane_shell=$(ps -p "$pane_pid" -o comm= 2>/dev/null || echo "bash")
+
+      # Get active virtualenv path (just the path, not the full environment)
+      local pane_env_virtual=""
+      pane_env_virtual=$(cat /proc/"$pane_pid"/environ 2>/dev/null | tr '\0' '\n' | grep '^VIRTUAL_ENV=' | cut -d= -f2- || true)
+
+      echo "          {"
+      echo "            \"index\": $pane_idx,"
+      echo "            \"path\": \"$(json_escape "$pane_path")\","
+      echo "            \"command\": \"$(json_escape "$pane_cmd")\","
+      echo "            \"shell\": \"$(json_escape "$pane_shell")\","
+      [ -n "$pane_title" ] && echo "            \"title\": \"$(json_escape "$pane_title")\","
+      [ -n "$pane_env_virtual" ] && echo "            \"virtualenv\": \"$(json_escape "$pane_env_virtual")\","
+      echo "            \"width\": $pane_w,"
+      echo "            \"height\": $pane_h"
+      echo "          }"
+    done
+
+    echo "        ]"
+    echo "      }"
+  done
+
+  echo "    ]"
+  echo "  }"
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  --help|-h)  usage ;;
+  --list|-l)  list_snapshots ;;
+  --delete|-d)
+    [ -n "${2:-}" ] || die "usage: tmux-freeze --delete SNAPSHOT_NAME"
+    delete_snapshot "$2"
+    ;;
+esac
+
+# Check tmux is running
+tmux list-sessions &>/dev/null || die "tmux server is not running"
+
+# Determine which sessions to freeze
+if [ -n "${1:-}" ]; then
+  sessions="$1"
+  tmux has-session -t "$1" 2>/dev/null || die "session not found: $1"
+else
+  sessions=$(tmux list-sessions -F '#{session_name}')
+fi
+
+[ -n "$sessions" ] || die "no tmux sessions found"
+
+# Build timestamp and output file
+timestamp=$(date +%Y%m%d_%H%M%S)
+if [ -n "${1:-}" ]; then
+  outfile="$FREEZE_DIR/${1}_${timestamp}.json"
+else
+  outfile="$FREEZE_DIR/all_${timestamp}.json"
+fi
+
+# Generate JSON
+{
+  echo "{"
+  echo "  \"frozen_at\": \"$(date -Iseconds)\","
+  echo "  \"hostname\": \"$(hostname)\","
+  echo "  \"tmux_version\": \"$(tmux -V | awk '{print $2}')\","
+  echo "  \"sessions\": ["
+
+  first_session=true
+  while IFS= read -r session; do
+    if [ "$first_session" = true ]; then
+      first_session=false
+    else
+      echo "    ,"
+    fi
+    freeze_session "$session"
+  done <<< "$sessions"
+
+  echo "  ]"
+  echo "}"
+} > "$outfile"
+
+# Also save a "latest" symlink for easy thawing
+ln -sf "$outfile" "$FREEZE_DIR/latest.json"
+
+# Only print status when running interactively (not from run-shell hooks)
+if [ -t 1 ]; then
+  echo "Frozen $(echo "$sessions" | wc -l | tr -d ' ') session(s) → $outfile"
+  echo "Symlinked → $FREEZE_DIR/latest.json"
+fi
