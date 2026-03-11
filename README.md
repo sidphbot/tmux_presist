@@ -1,4 +1,4 @@
-# tmux-restore
+# tmux-persist
 
 Snapshot and restore tmux sessions across reboots — preserving window layouts, pane splits, working directories, and running commands.
 
